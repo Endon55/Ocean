@@ -1,0 +1,5 @@
+/tmp/
+.build_cache
+*.so
+
+/shaders/compiled/
