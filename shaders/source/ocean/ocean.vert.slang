@@ -42,13 +42,13 @@ struct PushConstants
 [vk_push_constant]
 PushConstants push_constants;
 
-[[vk::binding(0, 0)]]
-ParameterBlock<SceneData> scene_data;
+[[vk::binding(0, 1)]]
+SceneData scene_data;
 
 [[vk::binding(1, 1)]]
-ConstantBuffer<OceanData> ocean_data;
+OceanData ocean_data;
 
-[[vk::binding(2, 1)]]
+//[[vk::binding(2, 1)]]
 Sampler2D spectrum;
 
 

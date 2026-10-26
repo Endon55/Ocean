@@ -34,25 +34,24 @@ struct Ocean_Data {
 };
 
 struct Random_Sampler {
-    float[256] nums;
-}
-
+    float nums[256];
+};
 [[vk_binding(0, 0)]]
+Texture2D<float4> images[];
+
+[[vk_binding(0, 1)]]
 RWTexture2D<float4> image;
 
 
-[[vk_binding(1, 0)]]
+[[vk_binding(1, 1)]]
 ConstantBuffer<Ocean_Data> ocean_data;
 
-[[vk_binding(1, 1)]]
-SpectrumParams params;
+[[vk_binding(2, 1)]]
+ConstantBuffer<SpectrumParams> params;
 
 
-[[vk_binding(2, 0)]]
-ConstantBuffer<Random_Sampler> random_sampler;
-
-
-
+[[vk_binding(3, 1)]]
+StructuredBuffer<Random_Sampler> random_sampler;
 
 
 float compute_peaking(float significant_wave_height, float one_over_peak) {
@@ -143,8 +142,7 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
         float x_shift = wave_count * cos_angle;
         float z_shift = wave_count * sin_angle;
 
-        
-        float phase = (x_shift * x + z_shift * z + random_sampler.nums[i] * 2.0 * PI) - (oscillation_speed * ocean_data.time);
+        float phase = (x_shift * x + z_shift * z + random_sampler[0].nums[i] * 2.0 * PI) - (oscillation_speed * ocean_data.time);
 
         /*
             When these sin waves add up they can add so much displacement that vertices can go past their neighbor, which results in the peaks of the waves going inside out.
