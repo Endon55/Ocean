@@ -1,5 +1,3 @@
-
-
 #define PI 3.1415926
 #define GRAVITY 9.81
 static const float Y_GAMMA = 3.3;
@@ -31,6 +29,7 @@ struct Ocean_Data {
     uint mesh_size_x;
     uint mesh_size_y;
     uint texture_size;
+    uint spectrum_index;
 };
 
 struct Random_Sampler {
@@ -38,18 +37,15 @@ struct Random_Sampler {
 };
 [[vk_binding(0, 0)]]
 Texture2D<float4> images[];
+[[vk_binding(1, 0)]]
+SamplerState samplers[];
 
 [[vk_binding(0, 1)]]
 RWTexture2D<float4> image;
-
-
 [[vk_binding(1, 1)]]
 ConstantBuffer<Ocean_Data> ocean_data;
-
 [[vk_binding(2, 1)]]
 ConstantBuffer<SpectrumParams> params;
-
-
 [[vk_binding(3, 1)]]
 StructuredBuffer<Random_Sampler> random_sampler;
 
@@ -150,63 +146,18 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
             Rollover is the current amount of rollover, anything greater than 1.0 is a rollover. 
         */
         float rollover_fix_delta = 1.0;
-        if(params.toggle == true) {
-            float rollover = amplitude * wave_count;
-            rollover_fix_delta = (rollover > 1.0) ? (1.0 / rollover) : 1.0;
 
-        }
-        displacement.x -= rollover_fix_delta * amplitude * sin(phase) * cos_angle;
+        displacement.x += amplitude * sin(phase) * cos_angle;
         displacement.y += amplitude * cos(phase);
-        displacement.z -= rollover_fix_delta * amplitude * sin(phase) * sin_angle;
-        if(params.toggle == true) {
-            float d_cos = -rollover_fix_delta * amplitude * cos(phase) * wave_count;
-            dxdx += d_cos * cos_angle * cos_angle;
-            dxdz += d_cos * cos_angle * sin_angle;
-            dzdz += d_cos * sin_angle * sin_angle;
-        }
+        displacement.z += amplitude * sin(phase) * sin_angle;
     } 
-        if(params.toggle == true) {
-            /*
-                Scaling every wave's horizontal displacement by s scales the derivatives by s too, so the
-                Jacobian becomes a quadratic in s:
-                    J(s) = 1 + s*(dxdx + dzdz) + s^2*(dxdx*dzdz - dxdz^2)
-                We find the largest s in [0, 1] that keeps J(s) >= jacobian_floor instead of using an arbitrary falloff.
-            */
-            float jacobian_floor = 0.1;
-            float jacobian = (1.0 + dxdx) * (1.0 + dzdz) - (dxdz * dxdz);
-            if (jacobian < jacobian_floor) {
-                float quad_a = dxdx * dzdz - dxdz * dxdz;
-                float quad_b = dxdx + dzdz;
-                float quad_c = 1.0 - jacobian_floor;
-
-                float s = 1.0;
-                if (abs(quad_a) < 1e-6) {
-                    if (abs(quad_b) > 1e-6) {
-                        float s_lin = -quad_c / quad_b;
-                        if (s_lin > 0.0) s = min(s, s_lin);
-                    }
-                } else {
-                    float discriminant = quad_b * quad_b - 4.0 * quad_a * quad_c;
-                    if (discriminant >= 0.0) {
-                        float root_term = sqrt(discriminant);
-                        float r1 = (-quad_b - root_term) / (2.0 * quad_a);
-                        float r2 = (-quad_b + root_term) / (2.0 * quad_a);
-
-                        // Track the smallest positive root that brings us to the floor threshold
-                        if (r1 > 0.0) { s = min(s, r1); }
-                        if (r2 > 0.0) { s = min(s, r2); }
-                    } else {
-                        // If the discriminant is negative, no real root brings it exactly to the floor.
-                        // Scale aggressively down to protect the mesh integrity.
-                        s = 0.0;
-                    }
-                }
-                s = clamp(s, 0.0, 1.0);
-
-                displacement.x *= s;
-                displacement.z *= s;
-            }
-        }
         image[dispatchThreadID.xy] = float4(displacement, 1.0);
 }
 
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void COMPUTE_displacement(uint3 dispatchThreadID: SV_DispatchThreadID)
+{
+
+    
+}

@@ -12,9 +12,11 @@ struct VSOutput
 {
     float4 pos : SV_Position;
     [vk_location(0)]
-    float3 outColor : COLOR;
+    float3 outColor;
     [vk_location(1)]
-    float2 outUV : TEXCOORD0;
+    float2 outUV ;
+    [vk_location(2)]
+    float3 worldPos;
 };
 
 struct Vertex
@@ -28,9 +30,10 @@ struct Vertex
 
 struct OceanData {
     float time;
-    float ocean_x;
-    float ocean_y;
-    float padding;
+    uint mesh_size_x;
+    uint mesh_size_y;
+    uint texture_size;
+    uint spectrum_index;
 };
 
 struct PushConstants
@@ -42,15 +45,17 @@ struct PushConstants
 [vk_push_constant]
 PushConstants push_constants;
 
-[[vk::binding(0, 1)]]
-SceneData scene_data;
+[[vk_binding(0, 0)]]
+Texture2D<float4> images[];
 
-[[vk::binding(1, 1)]]
-OceanData ocean_data;
+[[vk_binding(1, 0)]]
+SamplerState samplers[];
 
-//[[vk::binding(2, 1)]]
-Sampler2D spectrum;
+[[vk_binding(0, 1)]]
+ConstantBuffer<SceneData> scene_data;
 
+[[vk_binding(1, 1)]]
+ConstantBuffer<OceanData> ocean_data;
 
 [shader("vertex")]
 VSOutput main(uint vertex_index: SV_VertexID)
@@ -60,9 +65,10 @@ VSOutput main(uint vertex_index: SV_VertexID)
     float4 position = float4(v.position, 1.0);
     VSOutput output;
     output.pos = position;
-    float4 spec = (spectrum.SampleLevel(float2(v.uv_x, v.uv_y), 0));
+    uint2 texel = uint2(clamp(float2(v.uv_x, v.uv_y), 0.0, 1.0) * float(ocean_data.texture_size - 1) + 0.5);
+    float4 spec = images[ocean_data.spectrum_index].SampleLevel(samplers[0], float2(v.uv_x, v.uv_y), 0.0);
     output.pos.xyz += spec.xyz;
-
+    output.worldPos = output.pos.xyz;
     output.pos = mul(scene_data.view_proj, mul(push_constants.render_matrix, output.pos));
 
     output.outColor = v.color.xyz;
