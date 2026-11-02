@@ -1,4 +1,4 @@
-
+#include "inc_ocean.slang"
 struct PSInput
 {
     float4 pos : SV_Position;
@@ -9,6 +9,9 @@ struct PSInput
     float2 outUV;
     [vk_location(2)]
     float3 worldPos;
+    //slot 1 i jacobian, slot 2 is 1.0=NaN
+    [vk_location(3)]
+    float4 misc;
 };
 
 struct PSOutput
@@ -17,24 +20,19 @@ struct PSOutput
     float4 out_frag_color : SV_Target0;
 };
 
-struct OceanData {
-    float time;
-    uint mesh_size_x;
-    uint mesh_size_y;
-    uint texture_size;
-    uint spectrum_index;
-};
-
 [[vk_binding(1, 1)]]
-ConstantBuffer<OceanData> globalData;
+ConstantBuffer<OceanData> ocean_data;
 
-// Fragment shader entry point
+/*
+    Engine assumes a z-up axis convention, reference the engine documentation for specifics
+    This ocean will abide that convention.
+*/
 [shader("fragment")]
 PSOutput main(PSInput input) : SV_Target
 {
     PSOutput output;
     float2 uv = input.outUV;
-    float time = globalData.time;
+    float time = ocean_data.time;
 
     // First wave direction and speed
     float2 waveDir1 = float2(0.5, 0.5);
@@ -49,19 +47,27 @@ PSOutput main(PSInput input) : SV_Target
     // Blend the two waves together
     float finalWave = (wave1 + wave2) * 0.5;
 
-    // Define water cnpilors
+    // Define water colors
     float overZ = (clamp(input.worldPos.z + 20, 0, 100) / 100);
     float4 deepWater = float4(uv.x, uv.y, 1.0, 1.0);
     float4 shallowWater = float4(0.1, 0.2, 0.8, 1.0);
     float4 bottomColor = float4(1.0, overZ, 0.0, 1.0);
-    if(input.frontFace){
-        output.out_frag_color = deepWater;
+    if(input.misc.y == 1.0) {
+        output.out_frag_color = float4(0.0, 0.0, 0.0, 1.0);
     }
-    else {
+    else if(!input.frontFace){
         output.out_frag_color = bottomColor;
     }
-    // Mix colors based on the moving wave value
-    //output.out_frag_color = lerp(deepWater, shallowWater, finalWave);
+    // else if(input.jacobian.x > 0 && input.jacobian.x <= 1) {
+    //     output.out_frag_color = float4(1.0, 1.0, 0, input.misc.x);
+    // } 
+    else if(input.misc.x > 1) {
+        output.out_frag_color = float4(1.0, 1.0, 1.0, input.misc.x - 1.0);
+    }
+    else {
+        output.out_frag_color = deepWater;
+    }
+
     return output; 
 }
 

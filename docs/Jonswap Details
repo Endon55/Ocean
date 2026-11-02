@@ -1,0 +1,45 @@
+We need to generate a bunch of "waves". Or Wave_Forms.
+Wave_Form: the sin wave that describes the wave.
+: Must have a period that fits exactly within the space. The FFT requires it and its also convenient for tiling the ocean.
+
+To generate a wave form we need an amplitude and an  oscillation_speed. 
+
+Since we want our wave forms to conform to real world ocean data, for this we will use the JONSWAP equation, but there are others.
+Note: The Jonswap spectrum is actually the Pierson Moskowitz spectrum + an extra y^b term.
+
+We choose an oscillation_speed(more on this later), and set some initial parameters and the JONSWAP will tell us how big the wave is. This gives us our Wave_Form. The oscillation_speed + the JONSWAP amplitude.
+
+We can then take that Wave_Form, shift it based on the current time and calculate how far the wave has shifted in the xyz directions and in the Vertex shader, we can add those offsets to the original grid coordinate which will slowly shift the coordinate through space.
+
+But as you may have noticed this is just 1 wave form, if you rendered it out now, you would just see a simple sin wave rolling across the ocean. The magic comes from having many thousands of waves happening at once.
+
+The Sum of Sines method: n^2 algorithm
+is to essentially loop through a a frequency range and generate a Wave_Form at each interval, then add the resulting displacements together. This gets computationally expensive fucking fast. You have to loop through every pixel, and then loop through each wave to add the offset. So each Wave_Form in an ocean of 256x256 is 65,536(vertices) calculations. 64 waves is 4.2m, 1024 waves is 67m calculations.
+
+In a realistic ocean you'd want to crank up the ocean size(it would have to tile, it would be simply impossible to calculate a continent sized ocean). We quickly reach billions of calculations.
+
+FFT method: nlog(n) algorithm
+Or we can use the Fast Fourier Transform. This is just a clever way to add the waves together without having to do it in n^2 time. Seriously, 4 billion calculations can be reduced to 1 million calculations.
+
+Basically it does a binary spliting of the total waves(getting it down to 2) then combines those 2 waves, steps up the binary tree, it combines those 2(4-2) waves with the previous 2 waves, and so on until it does all the waves. 
+imagine 8 waves. 1, 2, 3, 4, 5, 6, 7, 8
+we cut the list in a half and end up with 1,2,3,4 and 4,5,6,7,8
+split both again gives us, 1,2  3,4  5,6  7,8
+we combine each of those pairs giving us 12, 34, 56, 78,we then combine the next pairs 1234, 5678, we then combine them again 12345678.
+
+We just have to make sure the Wave_Form data is in a form that the FFT likes. Specifically Complext Form.
+
+Take a Wave_Form and split it by axis. Imagine you could view each axis as the hands of a clock. The hour hand is the x axis, Minute hand y, seconds is z. Rotate them however you want and you would be able to recreate the exact point in time the wave form was at.
+
+The FFT takes all the hour hands and runs the above binary calculation, then it takes all the minute hands, then the second hands. At the end it spits out all the displacements for each point in the ocean.
+
+The FFT wants the x,y position of the clock hands. Just the outer point of the clock circle which is perfect because the outer clock edge just happens to be encoding the amplitude as well.
+
+So however big the patch of ocean is, we'll use 256x256 as an example, we want to create a Wave_Form for each pixel. We then need to encode each of the axis to it's own texture.
+
+One more note: The FFT is actually 2 passses for each axis. A horizontal pass through all the texture rows, then a vertical pass through all the columns. The ouput texture contains 2 values, the displacement, and a garbage complex number.
+
+We run the FFT through each texture, and then reassemble the final offsets to a texture the vertex shader can read.
+
+
+

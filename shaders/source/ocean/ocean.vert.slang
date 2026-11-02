@@ -1,3 +1,5 @@
+#include "inc_ocean.slang"
+
 struct SceneData
 {
     float4x4 view;
@@ -17,6 +19,8 @@ struct VSOutput
     float2 outUV ;
     [vk_location(2)]
     float3 worldPos;
+    [vk_location(3)]
+    float4 misc;
 };
 
 struct Vertex
@@ -26,14 +30,6 @@ struct Vertex
     float3 normal;
     float uv_y;
     float4 color;
-};
-
-struct OceanData {
-    float time;
-    uint mesh_size_x;
-    uint mesh_size_y;
-    uint texture_size;
-    uint spectrum_index;
 };
 
 struct PushConstants
@@ -56,7 +52,10 @@ ConstantBuffer<SceneData> scene_data;
 
 [[vk_binding(1, 1)]]
 ConstantBuffer<OceanData> ocean_data;
-
+/*
+    Engine assumes a z-up axis convention, reference the engine documentation for specifics
+    This ocean will abide that convention.
+*/
 [shader("vertex")]
 VSOutput main(uint vertex_index: SV_VertexID)
 {
@@ -64,16 +63,20 @@ VSOutput main(uint vertex_index: SV_VertexID)
 
     float4 position = float4(v.position, 1.0);
     VSOutput output;
-    output.pos = position;
-    uint2 texel = uint2(clamp(float2(v.uv_x, v.uv_y), 0.0, 1.0) * float(ocean_data.texture_size - 1) + 0.5);
-    float4 spec = images[ocean_data.spectrum_index].SampleLevel(samplers[0], float2(v.uv_x, v.uv_y), 0.0);
-    output.pos.xyz += spec.xyz;
+    //float2 tiled_uvs = float2(position.x % ocean_data.texture_size, position.y % ocean_data.texture_size);
+    float2 uvs = float2(v.uv_x, v.uv_y);
+    float4 spec = images[ocean_data.spectrum_index].SampleLevel(samplers[0], uvs,  0.0);
+    output.pos = float4(position.xyz + spec.xyz, 1.0);
     output.worldPos = output.pos.xyz;
     output.pos = mul(scene_data.view_proj, mul(push_constants.render_matrix, output.pos));
 
     output.outColor = v.color.xyz;
     output.outUV.x = v.uv_x;
     output.outUV.y = v.uv_y;
-
+    
+    output.misc = float4(spec.w, 0.0, 0.0, 0.0);
+    if(isnan(position.x) || isnan(position.y) || isnan(position.z) || isnan(spec.w)) {
+        output.misc.y = 1.0;
+    }
     return output;
 }
