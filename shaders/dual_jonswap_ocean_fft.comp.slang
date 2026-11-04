@@ -9,8 +9,10 @@
 #define PI 3.14159265358979323846
 
 Texture2D<float2> _PingTex;
-RWTexture2DArray<float4> _SpectrumTextures, _InitialSpectrumTextures, _DisplacementTextures;
-RWTexture2DArray<float2> _SlopeTextures;
+RWTexture2DArray<float4> _SpectrumTextures; //8 layers
+RWTexture2DArray<float4> _InitialSpectrumTexturesd; //4 layers
+RWTexture2DArray<float4>  _DisplacementTextures; //4 layers
+RWTexture2DArray<float2> _SlopeTextures; //4 layers
 RWTexture2D<half> _BuoyancyData;
 
 float _FrameTime, _DeltaTime, _A, _Gravity, _RepeatTime, _Damping, _Depth, _LowCutoff, _HighCutoff;
@@ -26,7 +28,7 @@ float2 ComplexMult(float2 a, float2 b) {
 float2 EulerFormula(float x) {
     return float2(cos(x), sin(x));
 }
-
+//returns a value between 0 and 1
 float hash(uint n) {
     // integer hash copied from Hugo Elias
     n = (n << 13U) ^ n;
@@ -252,16 +254,18 @@ RWTexture2DArray<float4> _FourierTarget;
 bool _Direction;
 
 groupshared float4 fftGroupBuffer[2][SIZE];
-
 void ButterflyValues(uint step, uint index, out uint2 indices, out float2 twiddle) {
     const float twoPi = 6.28318530718;
+    //Bit shifting once is equivelent to dividing 2.
     uint b = SIZE >> (step + 1);
     uint w = b * (index / b);
     uint i = (w + index) % SIZE;
+    //Sin value in twiddle.y and Cos in twiddlt.x
     sincos(-twoPi / SIZE * w, twiddle.y, twiddle.x);
 
     //This is what makes it the inverse FFT
     twiddle.y = -twiddle.y;
+    //The 2 indexes that we run this phase on.
     indices = uint2(i, i + b);
 }
 
@@ -276,8 +280,9 @@ float4 FFT(uint threadIndex, float4 input) {
         float2 twiddle;
         ButterflyValues(step, threadIndex, inputsIndices, twiddle);
 
+        float4 u = fftGroupBuffer[flag][inputsIndices.x];
         float4 v = fftGroupBuffer[flag][inputsIndices.y];
-        fftGroupBuffer[!flag][threadIndex] = fftGroupBuffer[flag][inputsIndices.x] + float4(ComplexMult(twiddle, v.xy), ComplexMult(twiddle, v.zw));
+        fftGroupBuffer[!flag][threadIndex] = u + float4(ComplexMult(twiddle, v.xy), ComplexMult(twiddle, v.zw));
 
         flag = !flag;
         GroupMemoryBarrierWithGroupSync();

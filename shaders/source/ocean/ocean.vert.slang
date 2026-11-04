@@ -65,7 +65,7 @@ VSOutput main(uint vertex_index: SV_VertexID)
     VSOutput output;
     //float2 tiled_uvs = float2(position.x % ocean_data.texture_size, position.y % ocean_data.texture_size);
     float2 uvs = float2(v.uv_x, v.uv_y);
-    float4 spec = images[ocean_data.spectrum_index].SampleLevel(samplers[0], uvs,  0.0);
+    float4 spec = images[ocean_data.displacement_index].SampleLevel(samplers[0], uvs,  0.0);
     output.pos = float4(position.xyz + spec.xyz, 1.0);
     output.worldPos = output.pos.xyz;
     output.pos = mul(scene_data.view_proj, mul(push_constants.render_matrix, output.pos));
