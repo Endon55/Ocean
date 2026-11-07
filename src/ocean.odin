@@ -10,15 +10,15 @@ import im "libs:imgui"
 // resolution must stay proportional to patch_size (deltaK = 2*pi/patch_size) or the energetic
 // wavenumbers collapse into a tiny blob at the texture center
 
-SPECTRUM_TEXTURE_SIZE :: 256
+GLOBALS : ^astro.Engine_Globals
+
+SPECTRUM_TEXTURE_SIZE :: 512 
 DOMAIN_GRAPH_EXTENT :: vk.Extent3D{SPECTRUM_TEXTURE_SIZE, SPECTRUM_TEXTURE_SIZE, 1}
 
-OCEAN_LAYER_COUNT :: 32
-OCEAN_PLANE_SIZE :: SPECTRUM_TEXTURE_SIZE * 4
-OCEAN_PATCH_SIZE :: SPECTRUM_TEXTURE_SIZE * 2
+OCEAN_PLANE_SIZE :: 1024
+OCEAN_PATCH_SIZE :: SPECTRUM_TEXTURE_SIZE 
 OCEAN_VERTEX_DENSITY :: 1
-
-GLOBALS : ^astro.Engine_Globals
+OCEAN_SPECTRUMS :: 4
 TEXTURES :: 3
 Ocean :: struct {
 
@@ -50,7 +50,7 @@ Ocean_Compute :: struct {
 Ocean_Data :: struct {
     time: f32,
     tile_time: f32,
-    tile_size: u32,
+    patch_size: u32,
     ocean_depth: f32,
     mesh_size_x: u32,
     mesh_size_y: u32,
@@ -58,26 +58,32 @@ Ocean_Data :: struct {
     mesh_gap_size: f32, 
     spectrum_texel_size: f32,
     displacement_index: u32,
+
     spectrums:u32,
 }
 
 
 Spectrum_Parameters :: struct {
-    initialized: b32,
-    length_scale: u32,
-    scale:f32,
-    storm_maturity: f32,
-    wind_speed: f32,
-    wind_span:f32,
-    choppiness: f32, 
 
-    scale_coefficient: f32,
-    short_wave_fade:f32,
-    wind_spread_control:f32,
+    length_scale: [OCEAN_SPECTRUMS]i32,
+    scale: [OCEAN_SPECTRUMS]f32,
+    storm_maturity: [OCEAN_SPECTRUMS]f32,
+
+    wind_speed: [OCEAN_SPECTRUMS]f32,
+    wind_span: [OCEAN_SPECTRUMS]f32,
+    wind_angle: [OCEAN_SPECTRUMS]f32,
+
+    choppiness: [OCEAN_SPECTRUMS]f32, 
+    short_wave_fade: [OCEAN_SPECTRUMS]f32,
+
+    wind_spread_control:[OCEAN_SPECTRUMS]f32,
+
+    initialized: [OCEAN_SPECTRUMS]b32,
+    swell:f32,
+    toggle:b32,
     jacobian_modifier: f32,
 
-    toggle: b32,
-    
+
 }
 
 
@@ -86,7 +92,7 @@ game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
 
     scene.scene_data_ptr = rawptr(new(Ocean))
     ocean := cast(^Ocean)scene.scene_data_ptr
-    ocean.spectrums = 1 
+    ocean.spectrums = OCEAN_SPECTRUMS
 
     fragment, has_fragment := astro.shader_manager_get_shader(&engine.shader_manager, "game/ocean/ocean.frag")
     vertex, has_vertex := astro.shader_manager_get_shader(&engine.shader_manager, "game/ocean/ocean.vert")
@@ -103,9 +109,9 @@ game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
         .COLOR_ATTACHMENT
     }
     //Initial Spectrum Texture
-    ocean.compute_data.image_allocations[0] = astro.create_image_default(engine, DOMAIN_GRAPH_EXTENT, .R16G16B16A16_SFLOAT, image_usages) or_return
+    ocean.compute_data.image_allocations[0] = astro.create_image_default(engine, DOMAIN_GRAPH_EXTENT, .R16G16B16A16_SFLOAT, image_usages, layers = OCEAN_SPECTRUMS) or_return
     //Spectrum Texture
-    ocean.compute_data.image_allocations[1] = astro.create_image_default(engine, DOMAIN_GRAPH_EXTENT, .R32G32B32A32_SFLOAT, image_usages, layers = ocean.spectrums * 2) or_return
+    ocean.compute_data.image_allocations[1] = astro.create_image_default(engine, DOMAIN_GRAPH_EXTENT, .R32G32B32A32_SFLOAT, image_usages, layers = OCEAN_SPECTRUMS * 2) or_return
     //Displacement Texture
     ocean.compute_data.image_allocations[2] = astro.create_image_default(engine, DOMAIN_GRAPH_EXTENT, .R32G32B32A32_SFLOAT, image_usages) or_return
     ocean.compute_data.textures[0] = astro.memory_manager_register_texture(ocean.compute_data.image_allocations[0]) or_return
@@ -144,24 +150,30 @@ game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
     ocean.plane_transform = la.matrix4_translate_f32({-OCEAN_PLANE_SIZE / 2, -OCEAN_PLANE_SIZE / 2, 0})
 
     ocean.ocean_data.spectrums = ocean.spectrums 
-    ocean.ocean_data.tile_time = 100.0 
+    ocean.ocean_data.tile_time = 256.0 
     ocean.ocean_data.ocean_depth = 10.0 
-    ocean.ocean_data.tile_size = OCEAN_PATCH_SIZE 
+    ocean.ocean_data.patch_size = OCEAN_PATCH_SIZE 
     ocean.ocean_data.mesh_size_x = OCEAN_PLANE_SIZE
     ocean.ocean_data.mesh_size_y = OCEAN_PLANE_SIZE
     ocean.ocean_data.texture_size = DOMAIN_GRAPH_EXTENT.width
     ocean.ocean_data.displacement_index = ocean.compute_data.textures[2].heap_ref.index
     ocean.ocean_data.mesh_gap_size = (1.0 / f32(OCEAN_VERTEX_DENSITY))
     ocean.ocean_data.spectrum_texel_size = (f32(OCEAN_PLANE_SIZE) / f32(SPECTRUM_TEXTURE_SIZE))
-
+    scale: i32 = 32 
+    for i in 0..<OCEAN_SPECTRUMS {
+        ocean.compute_data.spectrum_params.length_scale[i] = scale << (u32(i * 2))
+    }
+    ocean.compute_data.spectrum_params.initialized = false 
     ocean.compute_data.spectrum_params.scale = 1.0 
     ocean.compute_data.spectrum_params.storm_maturity = 3.3
-    ocean.compute_data.spectrum_params.scale_coefficient = .076 
     ocean.compute_data.spectrum_params.choppiness = 0.5
+
+    ocean.compute_data.spectrum_params.wind_spread_control = 0.5
     ocean.compute_data.spectrum_params.wind_speed = 10
     ocean.compute_data.spectrum_params.wind_span = 100
+    ocean.compute_data.spectrum_params.wind_angle = 180
+
     ocean.compute_data.spectrum_params.short_wave_fade = 1.5
-    ocean.compute_data.spectrum_params.wind_spread_control = 0.5 
     ocean.compute_data.spectrum_params.jacobian_modifier = 1.0 
 
 
@@ -241,12 +253,11 @@ game_draw :: proc(scene: ^astro.Scene, engine: ^astro.Engine, cmd: vk.CommandBuf
     if(!ocean.spectrum_initialized || any_spectrums_outdated(ocean)){
 
         if(!ocean.spectrum_initialized) {
-            astro.transition_image(cmd, ocean_sim.textures[0].image.image, .UNDEFINED, .SHADER_READ_ONLY_OPTIMAL) 
+            astro.transition_image(cmd, ocean_sim.textures[0].image.image, .UNDEFINED, .GENERAL) 
             astro.transition_image(cmd, ocean_sim.textures[1].image.image, .UNDEFINED, .SHADER_READ_ONLY_OPTIMAL)
             astro.transition_image(cmd, ocean_sim.textures[2].image.image, .UNDEFINED, .SHADER_READ_ONLY_OPTIMAL)
         }
 
-    astro.transition_image(cmd, ocean_sim.textures[0].image.image, .SHADER_READ_ONLY_OPTIMAL, .GENERAL)
 
         astro.shader_pipeline_bind(&ocean_sim.pipelines["COMPUTE_initial_spectrum"], cmd, engine)
         vk.CmdDispatch(
@@ -269,9 +280,11 @@ game_draw :: proc(scene: ^astro.Scene, engine: ^astro.Engine, cmd: vk.CommandBuf
 
         // These images have not been used before this frame.
 
-        astro.transition_image(cmd, ocean_sim.textures[0].image.image, .GENERAL, .SHADER_READ_ONLY_OPTIMAL)
 
         ocean.spectrum_initialized = true
+        for i in 0..<OCEAN_SPECTRUMS {
+            ocean.compute_data.spectrum_params.initialized[i] = true
+        }
     }
     
     //PRE-FFT Update
@@ -301,6 +314,7 @@ game_draw :: proc(scene: ^astro.Scene, engine: ^astro.Engine, cmd: vk.CommandBuf
         1, SPECTRUM_TEXTURE_SIZE, 1,
     )
 
+    astro.image_barrier(cmd, .SHADER_READ, .COMPUTE_SHADER, ocean_sim.textures[1].image)
 
     astro.transition_image(cmd, ocean_sim.textures[2].image.image, .SHADER_READ_ONLY_OPTIMAL, .GENERAL)
     astro.shader_pipeline_bind(&ocean_sim.pipelines["COMPUTE_finalize"], cmd, engine)
@@ -336,9 +350,15 @@ game_render :: proc(scene: ^astro.Scene, engine: ^astro.Engine, cmd: vk.CommandB
 }
 
 any_spectrums_outdated :: proc(ocean:^Ocean) -> bool {
-    return !ocean.compute_data.spectrum_params.initialized
+    params:= ocean.compute_data.spectrum_params
+    for i in 0..< OCEAN_SPECTRUMS {
+        if !params.initialized[i] {
+            return true
+        }
+    }
+    return false
 }
-
+single_mode : b32
 @(export)
 game_draw_ui :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok:bool) { 
     ocean: ^Ocean = cast(^Ocean)scene.scene_data_ptr
@@ -346,16 +366,64 @@ game_draw_ui :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok:bool) {
     ocean_data := &ocean.ocean_data
     if im.Begin("Ocean", nil, {.AlwaysAutoResize}) {
         params := ocean_sim.spectrum_params
-        if im.Checkbox("Toggle", cast(^bool)&params.toggle) do params.initialized = false
-        if im.SliderFloat("Scale", &params.scale, 0.0, 100) do params.initialized = false
-        if im.SliderFloat("Wind speed", &params.wind_speed, 0.0, 30.0) do params.initialized = false
-        if im.SliderFloat("Wind span", &params.wind_span, 10.0, 120.0) do params.initialized = false
-        if im.SliderFloat("Choppiness", &params.choppiness, 0.05, 10.0) do params.initialized = false
-        if im.SliderFloat("Storm Maturity", &params.storm_maturity, 1.0, 10.0) do params.initialized = false
-        if im.SliderFloat("Short Wave Fade", &params.short_wave_fade, .1, 10.0) do params.initialized = false
-        if im.SliderFloat("Wind Spread Control", &params.wind_spread_control, 0.0, 1.0) do params.initialized = false
-        if im.SliderFloat("Scale Coefficient", &params.scale_coefficient, 0.01, 1.0) do params.initialized = false
-        if im.SliderFloat("Jacobian Modifier", &params.jacobian_modifier, 0.01, 10) do params.initialized = false
+        im.Text("Global Ocean Values")
+
+        
+        if im.Checkbox("Single Spectrum Mode", cast(^bool)&single_mode) {
+            scale : f32 = (single_mode ? 0.0 : 1.0)
+           for i in 1..<OCEAN_SPECTRUMS {
+                params.scale[i] = scale
+                
+           } 
+           params.initialized[0] = false
+        }
+
+        if im.Checkbox("Toggle", cast(^bool)&params.toggle) {
+            params.initialized = false;
+        }      
+        if im.SliderFloat("Jacobian Modifier", &params.jacobian_modifier, 0.01, 10) {
+            params.initialized = false
+        }
+        spectrums:= (single_mode ? 1 : OCEAN_SPECTRUMS)
+        for i in 0..< spectrums {
+            im.PushIDInt(i32(i))
+            im.Text("Spectrum: %i", i) 
+
+            if im.SliderInt("Length Scale", &params.length_scale[i], 2, 4096) {
+                params.initialized[i] = false
+            }
+            if im.SliderFloat("Scale", &params.scale[i], 0.0, 100) {
+                params.initialized[i] = false
+            } 
+            im.Separator();
+            if im.SliderFloat("Wind Angle", &params.wind_angle[i], 0.0, 360.0) {
+                params.initialized[i] = false
+            }
+            if im.SliderFloat("Wind Speed", &params.wind_speed[i], 0.0, 30.0) {
+                params.initialized[i] = false
+            }
+            if im.SliderFloat("Wind Span", &params.wind_span[i], 10.0, 120.0) {
+                params.initialized[i] = false
+            } 
+            if im.SliderFloat("Wind Spread Control", &params.wind_spread_control[i], 0.0, 1.0) {
+                params.initialized[i] = false
+            }
+            im.Separator();
+            if im.SliderFloat("Choppiness", &params.choppiness[i], 0.05, 10.0) {
+                params.initialized[i] = false
+            }
+            if im.SliderFloat("Storm Maturity", &params.storm_maturity[i], 1.0, 10.0) {
+                params.initialized[i] = false
+            }
+            if im.SliderFloat("Short Wave Fade", &params.short_wave_fade[i], .1, 10.0) {
+                params.initialized[i] = false
+            }
+    
+
+            im.Separator();
+            im.Separator();
+            im.PopID()
+        }
     }
     im.End()
 

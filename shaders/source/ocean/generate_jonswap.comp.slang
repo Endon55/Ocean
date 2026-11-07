@@ -3,29 +3,34 @@
 #define PI 3.1415926
 #define GRAVITY 9.81
 #define SEED 10
-#define TEXTURE_SIZE 256 
+#define TEXTURE_SIZE 512 
+#define SPECTRUMS 4
 static const int LOG_SIZE = int(log2(TEXTURE_SIZE));
 // static const int SIZE = 1024;
 static const float Y_GAMMA = 3.3;
-static const float g = 9.81;
 static const float _2PI = PI * 2;
+static const float WIND_SCALE_COEFFICIENT = .076;
+
 struct SpectrumParams
 {
-    bool initialized;
-    uint length_scale;
-    float scale;
+    int length_scale[SPECTRUMS]; //Sice of physical ocean this spectrum represents ie. 32x32 meters, vs 256x256 meters.
+    float scale[SPECTRUMS]; //Overal scale of the spectrum.
     //1 for nothing, 3.3 for average, and 5+ for storm levels
-    float storm_maturity;
-	float windSpeed;
-    float windSpan;
-    float choppiness; 
-	float scale_coefficient;
-    float short_wave_fade;
-    float wind_spread_control;
-    float jacobian_modifier;
+    float storm_maturity[SPECTRUMS];
 
+	float wind_speed[SPECTRUMS];
+    float wind_span[SPECTRUMS]; //How long the distance the wind is blowing for.
+    float wind_angle[SPECTRUMS];
+
+    float choppiness[SPECTRUMS]; 
+    float short_wave_fade[SPECTRUMS];
+
+    float wind_spread_control[SPECTRUMS];
+
+    bool initialized[SPECTRUMS];
+    float swell; //Waves from old wind ie. wave randomness.
 	bool toggle;
-
+    float jacobian_modifier;
 };
 static const float CONST_G_PI_HZ = 0.0617096207211472951179130834577942599395883633750017968357;
 
@@ -36,7 +41,7 @@ Texture2D<float4> images[];
 SamplerState samplers[];
 
 [[vk_binding(0, 1)]]
-RWTexture2D<float4> initial_spectrum;
+RWTexture2DArray<float4> initial_spectrum;
 [[vk_binding(1, 1)]]
 RWTexture2DArray<float4> spectrum;
 [[vk_binding(2, 1)]]
@@ -44,7 +49,7 @@ RWTexture2D<float4> displacement;
 [[vk_binding(3, 1)]]
 ConstantBuffer<OceanData> ocean_data;
 [[vk_binding(4, 1)]]
-ConstantBuffer<SpectrumParams> params;
+ConstantBuffer<SpectrumParams, Std430DataLayout> params;
 
 
 //returns a value between 0 and 1
@@ -71,7 +76,9 @@ float2 EulerFormula(float x) {
 float2 complex_mult(float2 a, float2 b) {
     return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
-
+float cosine_spread(float wave_angle, float spread_power) {
+    return NormalisationFactor(spread_power) * pow(abs(cos(0.5 * wave_angle)), 2.0f * spread_power);
+}
 
 /*
     (a*g^2) / (16 * PI^4)  *  f^-5  * e^(-1.25 * (f / fm)^-4)  * y^b * z
@@ -88,24 +95,28 @@ float2 complex_mult(float2 a, float2 b) {
     X(wind_span)          = how much distance the wind had to push on the water
     z(y normalization)    = optional term to normalize the energy so that changing the y parameter doesn't change the total engery in the system.
 */
-float short_wave_fade(float wave_number, SpectrumParams params)
+float short_wave_fade(float wave_number, float short_wave_fade)
 {
-    return exp(-params.short_wave_fade * params.short_wave_fade * wave_number * wave_number);
+    return exp(-short_wave_fade * short_wave_fade * wave_number * wave_number);
 }
 
-float directional_spectrum(float wind_angle, float angular_frequency, float angular_frequency_peak, SpectrumParams params) {
+float directional_spectrum(float wave_angle, float wind_angle, float angular_frequency, float angular_frequency_peak, float wind_speed, float wind_spread_control) {
 
-    float spread_power = spread_power(angular_frequency, angular_frequency_peak, params.windSpeed);
+    float spread_power = spread_power_hasselmann(angular_frequency, angular_frequency_peak, wind_speed) + 16 * tanh(min(angular_frequency / angular_frequency_peak, 20)) * params.swell * params.swell;
 
-    float spread = NormalisationFactor(spread_power) * pow(abs(cos(0.5 * wind_angle)), 2 * spread_power);
 
-    return lerp(0.5 / PI, spread, params.wind_spread_control);
 
+    // float spread = NormalisationFactor(spread_power) * pow(abs(cos(0.5 * wind_angle)), 2 * spread_power);
+
+    // return spread;
+    // return lerp(0.5 / PI, spread, wind_spread_control);
+    float angle_delta = wave_angle - wind_angle;
+    return lerp(1.0f / PI * cos(angle_delta) * cos(angle_delta), cosine_spread(angle_delta, spread_power), wind_spread_control);
 
 }
-float spread_power(float angular_frequency, float angular_frequency_peak, float wind_speed) {
+float spread_power_hasselmann(float angular_frequency, float angular_frequency_peak, float wind_speed) {
     if(angular_frequency > angular_frequency_peak) {
-        return 9.77 * pow(abs(angular_frequency / angular_frequency_peak), -2.33 - 1.45 * (wind_speed * angular_frequency_peak / g - 1.17));
+        return 9.77 * pow(abs(angular_frequency / angular_frequency_peak), -2.33 - 1.45 * (wind_speed * angular_frequency_peak / GRAVITY - 1.17));
     }
     else {
         return 6.97 * pow(abs(angular_frequency / angular_frequency_peak), 4.06);
@@ -128,7 +139,7 @@ float calculate_angular_derivative(float wave_number, float angular_frequency, f
 }
 
 
-float jonswap_energy(float angular_frequency, float angular_frequency_peak, float scale_factor, SpectrumParams params) {
+float jonswap_energy(float angular_frequency, float angular_frequency_peak, float scale_factor, float storm_maturity) {
     //(g^2/16pi^4) == CONST_G_PI only works for Hz.
 
 
@@ -155,7 +166,7 @@ float jonswap_energy(float angular_frequency, float angular_frequency_peak, floa
     float peak_distribution = (angular_frequency / angular_frequency_peak) - 1.0;
     float b = exp(-0.5 * (peak_distribution * peak_distribution) / (sigma * sigma));
 
-    return params.scale * scale_factor * GRAVITY * GRAVITY * one_over_frequency * one_over_frequency * one_over_frequency * one_over_frequency * one_over_frequency * peak_cutoff * pow(params.storm_maturity, b) * (3.3 / params.storm_maturity);
+    return scale_factor * GRAVITY * GRAVITY * one_over_frequency * one_over_frequency * one_over_frequency * one_over_frequency * one_over_frequency * peak_cutoff * pow(storm_maturity, b) * (3.3 / storm_maturity);
 }
 
 
@@ -231,53 +242,61 @@ void COMPUTE_initial_spectrum(uint3 id: SV_DispatchThreadID)
        Those 3 are manditory
        3: 1/kLength, we can save this value instead of recalculating every frame.
      */
+    for(int i = 0; i < SPECTRUMS; i++) {
+
+        float texture_size = float(ocean_data.texture_size);
+        float water_depth = ocean_data.ocean_depth;
+
+        uint seed = SEED + id.x + id.y * uint(texture_size) + uint(texture_size) * i;
+
+        float2 half_texture = float2(texture_size * .5, texture_size * .5);
+        int2 id2 = id.xy;
+        if(id2.x >= half_texture.x) id2.x -= int(texture_size);
+        if(id2.y >= half_texture.y) id2.y -= int(texture_size);
 
 
-    float texture_size = float(ocean_data.texture_size);
-    float water_depth = ocean_data.ocean_depth;
 
-    uint seed = id.x + id.y * uint(texture_size) + uint(texture_size);
-    seed += SEED;
+        float wave_number_delta = (2.0f * PI) / params.length_scale[i];
+        
+        //has 2 separate wave numbers insid
+        float2 wave_number_vector = id2.xy * wave_number_delta;
+        //the compined wave number
+        float wave_number = length(wave_number_vector);
+        if(wave_number > 0) {
 
-    float2 half_texture = float2(texture_size * .5, texture_size * .5);
-    int2 id2 = id.xy;
-    if(id2.x >= half_texture.x) id2.x -= int(texture_size);
-    if(id2.y >= half_texture.y) id2.y -= int(texture_size);
+            float wind_speed = max(params.wind_speed[i], 0.001f);
+            //Converting KM to meter * 1000
+            float wind_span = max((params.wind_span[i] * 1000), 1.0f);
+            //Degrees to radians.
+            float wind_angle = (PI / 180) * (params.wind_angle[i] % 360);;
+
+            float angular_frequency_peak = 2 * PI * 3.5 * pow((GRAVITY * GRAVITY) / (wind_speed * wind_span), 1.0f / 3.0f);
+
+            float scale_factor = WIND_SCALE_COEFFICIENT * pow((wind_speed * wind_speed) / (GRAVITY * wind_span), 0.22);
+
+            float angular_frequency = calculate_angular_frequency(wave_number, water_depth);
+            float angular_frequency_derivative = calculate_angular_derivative(wave_number, angular_frequency, water_depth);
 
 
-    float ocean_patch_size = ocean_data.tile_size;
+            //y and x aren't swapped, the function just takes the params backwards.
+            float wave_angle = atan2(wave_number_vector.y, wave_number_vector.x);
+            float2 gauss_rand1 = gaussian_rand(hash(seed + 1), hash(seed + 2));
+            float2 gauss_rand2 = gaussian_rand(hash(seed + 3), hash(seed + 4));
+            //Total Energy in the system at this Frequency
+            float energy = params.scale[i] *
+            jonswap_energy(angular_frequency, angular_frequency_peak, scale_factor, params.storm_maturity[i]) *
+            directional_spectrum(wave_angle, wind_angle, angular_frequency, angular_frequency_peak, wind_speed, params.wind_spread_control[i]) *
+            short_wave_fade(wave_number, params.short_wave_fade[i]);
 
-    float wave_number_delta = (2.0f * PI) / ocean_patch_size;
-    //has 2 separate wave numbers inside
-    float2 wave_number_vector = id2.xy * wave_number_delta;
-    //the compined wave number
-    float wave_number = length(wave_number_vector);
-    if(wave_number > 0) {
-        float water_depth = 10.0;
-        float wind_speed = max(params.windSpeed, 0.001f);
-        //Converting KM to meter * 1000
-        float wind_span = max((params.windSpan * 1000), 1.0f);
-        float angular_frequency_peak = 2 * PI * 3.5 * pow((g * g) / (wind_speed * wind_span), 1.0f / 3.0f);
+            float amplitude = sqrt((2 * energy * angular_frequency_derivative / wave_number) * wave_number_delta * wave_number_delta);
 
-        float scale_factor = params.scale_coefficient * pow((wind_speed * wind_speed) / (g * wind_span), 0.22);
-
-        float angular_frequency = calculate_angular_frequency(wave_number, water_depth);
-        float angular_frequency_derivative = calculate_angular_derivative(wave_number, angular_frequency, water_depth);
-        //y and x aren't swapped, the function just takes the params backwards.
-        float angle = atan2(wave_number_vector.y, wave_number_vector.x);
-        float2 gauss_rand1 = gaussian_rand(hash(seed + 1), hash(seed + 2));
-        float2 gauss_rand2 = gaussian_rand(hash(seed + 3), hash(seed + 4));
-        //Total Energy in the system at this Frequency
-        float energy = jonswap_energy(angular_frequency, angular_frequency_peak, scale_factor, params) * directional_spectrum(angle, angular_frequency, angular_frequency_peak, params) * short_wave_fade(wave_number, params);
-
-        float amplitude = sqrt((2 * energy * angular_frequency_derivative / wave_number) * wave_number_delta * wave_number_delta);
-
-//We need both random values to be indepenent, and the way the gauss works is that both numbers it returns are coorelated, thus why we generate 2 sets and only use 1 value from each. 
-        //So the random number is choosing a random coordinate in (+x, +y) quadrant and by virtue of not being directly at zero degrees it gives us a random phase offset as well.
-        initial_spectrum[id.xy] = float4(float2(gauss_rand2.x, gauss_rand1.y) * amplitude, 0.0, 0.0);
-    }
-    else {
-        initial_spectrum[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+            //We need both random values to be indepenent, and the way the gauss works is that both numbers it returns are coorelated, thus why we generate 2 sets and only use 1 value from each. 
+            //So the random number is choosing a random coordinate in (+x, +y) quadrant and by virtue of not being directly at zero degrees it gives us a random phase offset as well.
+            initial_spectrum[uint3(id.xy, i)] = float4(float2(gauss_rand2.x, gauss_rand1.y) * amplitude, 0.0, 0.0);
+        }
+        else {
+            initial_spectrum[uint3(id.xy, i)] = float4(0.0, 0.0, 0.0, 0.0);
+        }
     }
 }
 [shader("compute")]
@@ -286,19 +305,21 @@ void COMPUTE_packed_spectrum(uint3 id: SV_DispatchThreadID)
 {
     //We have the wave components starting position(h0)(xy coords of a clock face)
     //We also need the wave components of the wave directly opposite of this one in the texture. ie, we have x=1, y=1. opposite woud be x=-1, y=-1
-    float2 w = initial_spectrum[id.xy].xy;
-    float2 w_conj = initial_spectrum[uint2((ocean_data.texture_size - id.x) % ocean_data.texture_size, (ocean_data.texture_size - id.y) % ocean_data.texture_size)].xy;
+    for(int i = 0; i < SPECTRUMS; i++) {
+        float2 w = initial_spectrum[uint3(id.xy, i)].xy;
+        float2 w_conj = initial_spectrum[uint3((ocean_data.texture_size - id.x) % ocean_data.texture_size, (ocean_data.texture_size - id.y) % ocean_data.texture_size, i)].xy;
 
-    /*
-        The reason we even need the conjugate is complicated and confusing.
-        Every wave has a direct opposite wave with a different amount of energy. ie Wave_A(10, 10) and Wave_B(-10, -10) they don't cancel out because they have different amounts of energy, but they do interact. 
-        
-        However, we can't guarantee they are in phase with each other. They're both getting advanced through time. We actually need the conjugate wave to move BACKWARDS through time.
-        This is just how the math works, don't overthink it. We don't have PHD's
+        /*
+           The reason we even need the conjugate is complicated and confusing.
+           Every wave has a direct opposite wave with a different amount of energy. ie Wave_A(10, 10) and Wave_B(-10, -10) they don't cancel out because they have different amounts of energy, but they do interact. 
 
-        You might be thinking that we're combining Wave_A with conjugate B, and Wave_B with conjugate A. Then the FFT comes along and merges modified Wave_A with modified Wave_B, this sounds like we're doing the same operation twice and breaking out waves. Apparently not, I don't have a clean answer for this but the fft apparently relies on this assumption.
-    */
-    initial_spectrum[id.xy] = float4(w, w_conj.x, -w_conj.y);
+           However, we can't guarantee they are in phase with each other. They're both getting advanced through time. We actually need the conjugate wave to move BACKWARDS through time.
+           This is just how the math works, don't overthink it. We don't have PHD's
+
+           You might be thinking that we're combining Wave_A with conjugate B, and Wave_B with conjugate A. Then the FFT comes along and merges modified Wave_A with modified Wave_B, this sounds like we're doing the same operation twice and breaking out waves. Apparently not, I don't have a clean answer for this but the fft apparently relies on this assumption.
+         */
+        initial_spectrum[uint3(id.xy, i)] = float4(w, w_conj.x, -w_conj.y);
+    }
 }
 
 
@@ -308,79 +329,81 @@ void COMPUTE_packed_spectrum(uint3 id: SV_DispatchThreadID)
 void COMPUTE_update_spectrum(uint3 id: SV_DispatchThreadID)
 {
     //Now we take the initial spectrum, advance it through time to find it's current state. Then derive the complex number pairs for each axis.
-    int i = 0;
-    float texture_size = float(ocean_data.texture_size);
-    float2 half_texture = float2(texture_size * .5, texture_size * .5);
 
-    float4 base_wave = initial_spectrum[id.xy];
+    for(int i = 0; i < SPECTRUMS; i++) {
+        float texture_size = float(ocean_data.texture_size);
+        float2 half_texture = float2(texture_size * .5, texture_size * .5);
 
-    int2 id2 = id.xy;
-    if(id2.x >= half_texture.x) id2.x -= int(texture_size);
-    if(id2.y >= half_texture.y) id2.y -= int(texture_size);
+        float4 base_wave = initial_spectrum[uint3(id.xy, i)];
 
-    float2 w = base_wave.xy;
-    float2 w_conj = base_wave.zw;
+        int2 id2 = id.xy;
+        if(id2.x >= half_texture.x) id2.x -= int(texture_size);
+        if(id2.y >= half_texture.y) id2.y -= int(texture_size);
 
-    float water_depth = ocean_data.ocean_depth;
-    float ocean_patch_size = ocean_data.tile_size;
+        float2 w = base_wave.xy;
+        float2 w_conj = base_wave.zw;
 
-    float wave_number_delta = (2.0f * PI) / ocean_patch_size;
-    float2 wave_number_vector = id2.xy * wave_number_delta;
-    float wave_number = length(wave_number_vector);
-    float wave_number_rcp = rcp(wave_number);
-    if(wave_number > 0) {
+        float water_depth = ocean_data.ocean_depth;
 
-        // float angular_frequency = calculate_angular_frequency(wave_number, water_depth);
-        //Before we were calculating the Exact perfect ocean frequency. But now to make the ocean work in a finite simulation we need to make some slight modifications.
-        //Now we calculate the angular_frequency based on a looping time that nudges each vertex a little bit to force it to tile properly.
-        float wave_time_delta = 2.0f * PI / ocean_data.tile_time;
-        float angular_frequency = floor(sqrt(GRAVITY * wave_number) / wave_time_delta) * wave_time_delta * ocean_data.time;
+        float wave_number_delta = (2.0f * PI) / float(params.length_scale[i]);
+        float2 wave_number_vector = id2.xy * wave_number_delta;
+        float wave_number = length(wave_number_vector);
+        float wave_number_rcp = rcp(wave_number);
+        if(wave_number > 0) {
 
-        float2 exponent = EulerFormula(angular_frequency);
-        //Wave at time
-        float2 w_t = complex_mult(w, exponent) + complex_mult(w_conj, float2(exponent.x, -exponent.y));
+            // float angular_frequency = calculate_angular_frequency(wave_number, water_depth);
+            //Before we were calculating the Exact perfect ocean frequency. But now to make the ocean work in a finite simulation we need to make some slight modifications.
+            //Now we calculate the angular_frequency based on a looping time that nudges each vertex a little bit to force it to tile properly.
+            float wave_time_delta = 2.0f * PI / ocean_data.tile_time;
+            float angular_frequency = floor(calculate_angular_frequency(wave_number, water_depth) / wave_time_delta) * wave_time_delta * (ocean_data.time % ocean_data.tile_time);
+            // float angular_frequency = floor(sqrt(GRAVITY * wave_number) / wave_time_delta) * wave_time_delta * (ocean_data.time % ocean_data.tile_time);
 
-        /* Multiplies the complex number wave_at_time by i.
-           Rotates exactly 90⸰ */
-        float2 iw_t = float2(-w_t.y, w_t.x);
-        //Complex axis number
-        float2 cx = iw_t * wave_number_vector.x * wave_number_rcp;
-        float2 cy = iw_t * wave_number_vector.y * wave_number_rcp;
-        float2 cz = w_t; 
-        
-        float2 cx_dx = -w_t * wave_number_vector.x * wave_number_vector.x * wave_number_rcp;
-        float2 cy_dx = -w_t * wave_number_vector.x * wave_number_vector.y * wave_number_rcp;
-        float2 cz_dx = iw_t * wave_number_vector.x;
+            /*
+               Right now we have 2 complex numbers, w0, and w0_conj. We need to move those vecotrs through time to the current time.
+               To rotate a vector through time we multiply it by Eulers Formula.
+               Forward in time:
+               e^(i*ϴ) == cosϴ + i*sinϴ
+               Backwards in time:
+               e^(i*ϴ) == cosϴ - i*sinϴ
 
-       float2 cz_dy = iw_t * wave_number_vector.y;
-       float2 cy_dy = -w_t * wave_number_vector.y * wave_number_vector.y * wave_number_rcp;
+               ComplexY = (h0 *(cos(phase) + i * sin(phase)) + h0_conj *(cos(phase) - i * sin(phase)))
 
-       float2 w_t_cx = float2(cx.x - cy.y, cx.y + cy.x);
-       float2 w_t_cy = float2(cz.x - cy_dx.y, cz.y + cy_dx.x);
-
-       float2 w_t_cx_slope = float2(cz_dx.x - cz_dy.y, cz_dx.y + cz_dy.x);
-       float2 w_t_cy_slope = float2(cx_dx.x - cy_dy.y, cx_dx.y + cy_dy.x);
+               The smart people have an optimized version that we use bellow. 
+             */
 
 
-        /*
-            Right now we have 2 complex numbers, h0, and h0_conj. We need to move those vecotrs through time to the current time.
-            To rotate a vector through time we multiply it by Eulers Formula.
-            Forward in time:
-            e^(i*ϴ) == cosϴ + i*sinϴ
-            Backwards in time:
-            e^(i*ϴ) == cosϴ - i*sinϴ
+            float2 exponent = EulerFormula(angular_frequency);
+            //Wave at time
+            float2 w_t = complex_mult(w, exponent) + complex_mult(w_conj, float2(exponent.x, -exponent.y));
 
-            ComplexY = (h0 *(cos(phase) + i * sin(phase)) + h0_conj *(cos(phase) - i * sin(phase)))
+            /* Multiplies the complex number wave_at_time by i.
+               Rotates exactly 90⸰ */
+            float2 iw_t = float2(-w_t.y, w_t.x);
+            //Complex axis number
+            float2 cx = iw_t * wave_number_vector.x * wave_number_rcp;
+            float2 cy = iw_t * wave_number_vector.y * wave_number_rcp;
+            float2 cz = w_t; 
 
-            The smart people have an optimized version that we use bellow. 
-        */
+            float2 cx_dx = -w_t * wave_number_vector.x * wave_number_vector.x * wave_number_rcp;
+            float2 cy_dx = -w_t * wave_number_vector.x * wave_number_vector.y * wave_number_rcp;
+            float2 cz_dx = iw_t * wave_number_vector.x;
 
-        spectrum[uint3(id.xy, i * 2)] = float4(w_t_cx, w_t_cy);
-        spectrum[uint3(id.xy, i * 2 + 1)] = float4(w_t_cx_slope, w_t_cy_slope);
-    }
-    else {
-        spectrum[uint3(id.xy, i * 2)] = float4(0.0, 0.0, 0.0, 0.0);
-        spectrum[uint3(id.xy, i * 2 + 1)] = float4(0.0, 0.0, 0.0, 0.0);
+            float2 cz_dy = iw_t * wave_number_vector.y;
+            float2 cy_dy = -w_t * wave_number_vector.y * wave_number_vector.y * wave_number_rcp;
+
+            float2 w_t_cx = float2(cx.x - cy.y, cx.y + cy.x);
+            float2 w_t_cy = float2(cz.x - cy_dx.y, cz.y + cy_dx.x);
+
+            float2 w_t_cx_slope = float2(cz_dx.x - cz_dy.y, cz_dx.y + cz_dy.x);
+            float2 w_t_cy_slope = float2(cx_dx.x - cy_dy.y, cx_dx.y + cy_dy.x);
+
+            spectrum[uint3(id.xy, i * 2)] = float4(w_t_cx, w_t_cy);
+            spectrum[uint3(id.xy, i * 2 + 1)] = float4(w_t_cx_slope, w_t_cy_slope);
+        }
+        else {
+            spectrum[uint3(id.xy, i * 2)] = float4(0.0, 0.0, 0.0, 0.0);
+            spectrum[uint3(id.xy, i * 2 + 1)] = float4(0.0, 0.0, 0.0, 0.0);
+        }
     }
 }
 
@@ -426,7 +449,7 @@ float4 fft(uint index, float4 input) {
 [numthreads(TEXTURE_SIZE, 1, 1)]
 void COMPUTE_horizontal_fft(uint3 id: SV_DispatchThreadID)
 {
-    for(int i = 0; i < ocean_data.spectrums * 2; ++i)
+    for(int i = 0; i < SPECTRUMS * 2; ++i)
     {
         spectrum[uint3(id.xy, i)] = fft(id.x, spectrum[uint3(id.xy, i)]);
     }
@@ -435,21 +458,18 @@ void COMPUTE_horizontal_fft(uint3 id: SV_DispatchThreadID)
 [numthreads(TEXTURE_SIZE, 1, 1)]
 void COMPUTE_vertical_fft(uint3 id: SV_DispatchThreadID)
 {
-    for(int i = 0; i < ocean_data.spectrums * 2; ++i)
+    for(int i = 0; i < SPECTRUMS * 2; ++i)
     {
         spectrum[uint3(id.yx, i)] = fft(id.x, spectrum[uint3(id.yx, i)]);
     }
-}
-
-float4 permute(float4 data, float3 id) {
-    return data * (1.0f - 2.0f * ((id.x + id.y) % 2));
 }
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void COMPUTE_finalize(uint3 id: SV_DispatchThreadID)
 {
-    for(int i = 0; i < ocean_data.spectrums; ++i) {
+    float3 total_displacement = float3(0.0, 0.0, 0.0);
+    for(int i = 0; i < SPECTRUMS; i++) {
 
         float4 w_t = spectrum[uint3(id.xy, i * 2)];
         float4 w_t_slope = spectrum[uint3(id.xy, i * 2 + 1)];
@@ -459,10 +479,10 @@ void COMPUTE_finalize(uint3 id: SV_DispatchThreadID)
         float2 dzxdzy = w_t_slope.rg;
         float2 dxxdyy = w_t_slope.ba;
 
-        float3 disp = float3(dxdy.x, dxdy.y, dzdxy.x);
-
-        displacement[id.xy] = float4(disp.xyz, 0.0);
+        // Every spectrum/cascade contributes to the same displacement texture.
+        total_displacement += float3(dxdy.x, dxdy.y, dzdxy.x);
     }
+    displacement[id.xy] = float4(total_displacement, 0.0);
 }
 
 float NormalisationFactor(float s)
