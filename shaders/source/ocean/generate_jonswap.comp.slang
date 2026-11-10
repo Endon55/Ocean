@@ -1,37 +1,5 @@
 #include "inc_ocean.slang"
 
-#define PI 3.1415926
-#define GRAVITY 9.81
-#define SEED 10
-#define TEXTURE_SIZE 512 
-#define SPECTRUMS 4
-static const int LOG_SIZE = int(log2(TEXTURE_SIZE));
-// static const int SIZE = 1024;
-static const float Y_GAMMA = 3.3;
-static const float _2PI = PI * 2;
-static const float WIND_SCALE_COEFFICIENT = .076;
-
-struct SpectrumParams
-{
-    int length_scale[SPECTRUMS]; //Sice of physical ocean this spectrum represents ie. 32x32 meters, vs 256x256 meters.
-    float scale[SPECTRUMS]; //Overal scale of the spectrum.
-    //1 for nothing, 3.3 for average, and 5+ for storm levels
-    float storm_maturity[SPECTRUMS];
-
-	float wind_speed[SPECTRUMS];
-    float wind_span[SPECTRUMS]; //How long the distance the wind is blowing for.
-    float wind_angle[SPECTRUMS];
-
-    float choppiness[SPECTRUMS]; 
-    float short_wave_fade[SPECTRUMS];
-
-    float wind_spread_control[SPECTRUMS];
-
-    bool initialized[SPECTRUMS];
-    float swell; //Waves from old wind ie. wave randomness.
-	bool toggle;
-    float jacobian_modifier;
-};
 static const float CONST_G_PI_HZ = 0.0617096207211472951179130834577942599395883633750017968357;
 
 
@@ -40,18 +8,35 @@ Texture2D<float4> images[];
 [[vk_binding(1, 0)]]
 SamplerState samplers[];
 
+
 [[vk_binding(0, 1)]]
-RWTexture2DArray<float4> initial_spectrum;
-[[vk_binding(1, 1)]]
-RWTexture2DArray<float4> spectrum;
-[[vk_binding(2, 1)]]
-RWTexture2D<float4> displacement;
-[[vk_binding(3, 1)]]
 ConstantBuffer<OceanData> ocean_data;
-[[vk_binding(4, 1)]]
+[[vk_binding(1, 1)]]
 ConstantBuffer<SpectrumParams, Std430DataLayout> params;
 
+[[vk_binding(2, 1)]]
+RWTexture2DArray<float4> initial_spectrum;
+[[vk_binding(3, 1)]]
+RWTexture2DArray<float4> spectrum;
+[[vk_binding(4, 1)]]
+RWTexture2DArray<float4> displacement;
+[[vk_binding(5, 1)]]
+RWTexture2DArray<float2> slope;
 
+
+
+
+
+float NormalisationFactor(float s)
+{
+	float s2 = s * s;
+	float s3 = s2 * s;
+	float s4 = s3 * s;
+	if (s < 5)
+		return -0.000564 * s4 + 0.00776 * s3 - 0.044 * s2 + 0.192 * s + 0.163;
+	else
+		return -4.80e-08 * s4 + 1.07e-05 * s3 - 9.53e-04 * s2 + 5.90e-02 * s + 3.93e-01;
+}
 //returns a value between 0 and 1
 float hash(uint n) {
     // integer hash copied from Hugo Elias
@@ -79,7 +64,27 @@ float2 complex_mult(float2 a, float2 b) {
 float cosine_spread(float wave_angle, float spread_power) {
     return NormalisationFactor(spread_power) * pow(abs(cos(0.5 * wave_angle)), 2.0f * spread_power);
 }
+float2 calculate_fade_boundaries_meters(int spectrum_index) {
 
+    float mid = params.length_scale[spectrum_index];
+
+    float lower_bound;
+    if(spectrum_index > 0) {
+        lower_bound = sqrt((2.0 * mid / ocean_data.texture_size) * params.length_scale[spectrum_index - 1]);
+    } else {
+        lower_bound = 0.0;
+    }
+
+    float upper_bound;
+    if(spectrum_index < SPECTRUMS - 1) {
+
+        upper_bound = sqrt((2.0 * mid / ocean_data.texture_size) * params.length_scale[spectrum_index + 1]);
+    } else {
+        upper_bound = mid;
+    }
+
+    return float2(lower_bound, upper_bound);
+}
 /*
     (a*g^2) / (16 * PI^4)  *  f^-5  * e^(-1.25 * (f / fm)^-4)  * y^b * z
     
@@ -95,9 +100,12 @@ float cosine_spread(float wave_angle, float spread_power) {
     X(wind_span)          = how much distance the wind had to push on the water
     z(y normalization)    = optional term to normalize the energy so that changing the y parameter doesn't change the total engery in the system.
 */
-float short_wave_fade(float wave_number, float short_wave_fade)
+float wave_fade_total(float wave_number, float2 fade_bounds_angular) {
+    return wave_fade(wave_number, fade_bounds_angular.x) * (1 - wave_fade(wave_number, fade_bounds_angular.y));
+}
+float wave_fade(float wave_number, float wave_fade)
 {
-    return exp(-short_wave_fade * short_wave_fade * wave_number * wave_number);
+    return exp(-wave_fade * wave_fade * wave_number * wave_number);
 }
 
 float directional_spectrum(float wave_angle, float wind_angle, float angular_frequency, float angular_frequency_peak, float wind_speed, float wind_spread_control) {
@@ -262,13 +270,15 @@ void COMPUTE_initial_spectrum(uint3 id: SV_DispatchThreadID)
         float2 wave_number_vector = id2.xy * wave_number_delta;
         //the compined wave number
         float wave_number = length(wave_number_vector);
+
+
         if(wave_number > 0) {
 
             float wind_speed = max(params.wind_speed[i], 0.001f);
             //Converting KM to meter * 1000
             float wind_span = max((params.wind_span[i] * 1000), 1.0f);
             //Degrees to radians.
-            float wind_angle = (PI / 180) * (params.wind_angle[i] % 360);;
+            float wind_angle = (PI / 180) * (params.wind_angle[i] % 360);
 
             float angular_frequency_peak = 2 * PI * 3.5 * pow((GRAVITY * GRAVITY) / (wind_speed * wind_span), 1.0f / 3.0f);
 
@@ -286,7 +296,7 @@ void COMPUTE_initial_spectrum(uint3 id: SV_DispatchThreadID)
             float energy = params.scale[i] *
             jonswap_energy(angular_frequency, angular_frequency_peak, scale_factor, params.storm_maturity[i]) *
             directional_spectrum(wave_angle, wind_angle, angular_frequency, angular_frequency_peak, wind_speed, params.wind_spread_control[i]) *
-            short_wave_fade(wave_number, params.short_wave_fade[i]);
+            wave_fade_total(wave_number, calculate_fade_boundaries_meters(i) / _2PI);
 
             float amplitude = sqrt((2 * energy * angular_frequency_derivative / wave_number) * wave_number_delta * wave_number_delta);
 
@@ -468,7 +478,6 @@ void COMPUTE_vertical_fft(uint3 id: SV_DispatchThreadID)
 [numthreads(16, 16, 1)]
 void COMPUTE_finalize(uint3 id: SV_DispatchThreadID)
 {
-    float3 total_displacement = float3(0.0, 0.0, 0.0);
     for(int i = 0; i < SPECTRUMS; i++) {
 
         float4 w_t = spectrum[uint3(id.xy, i * 2)];
@@ -480,18 +489,12 @@ void COMPUTE_finalize(uint3 id: SV_DispatchThreadID)
         float2 dxxdyy = w_t_slope.ba;
 
         // Every spectrum/cascade contributes to the same displacement texture.
-        total_displacement += float3(dxdy.x, dxdy.y, dzdxy.x);
+        // total_displacement += float3(dxdy.x, dxdy.y, dzdxy.x);
+        displacement[uint3(id.xy, i)] = float4(dxdy.x, dxdy.y, dzdxy.x, 0.0);
+
+        slope[uint3(id.xy, i)] = dzxdzy;
+
     }
-    displacement[id.xy] = float4(total_displacement, 0.0);
 }
 
-float NormalisationFactor(float s)
-{
-	float s2 = s * s;
-	float s3 = s2 * s;
-	float s4 = s3 * s;
-	if (s < 5)
-		return -0.000564 * s4 + 0.00776 * s3 - 0.044 * s2 + 0.192 * s + 0.163;
-	else
-		return -4.80e-08 * s4 + 1.07e-05 * s3 - 9.53e-04 * s2 + 5.90e-02 * s + 3.93e-01;
-}
+

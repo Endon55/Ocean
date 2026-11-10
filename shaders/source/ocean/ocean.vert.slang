@@ -1,25 +1,18 @@
 #include "inc_ocean.slang"
-
-struct SceneData
-{
-    float4x4 view;
-    float4x4 proj;
-    float4x4 view_proj;
-    float4 ambient_color;
-    float4 sunlight_direction; // w for sun power
-    float4 sunlight_color;
-};
+#include "../inc_scene_data.slang"
 
 struct VSOutput
 {
-    float4 pos : SV_Position;
+    float4 pos : SV_Position; 
     [vk_location(0)]
-    float3 outColor;
-    [vk_location(1)]
-    float2 outUV ;
-    [vk_location(2)]
     float3 worldPos;
+    [vk_location(1)]
+    float3 normal;
+    [vk_location(2)]
+    float4 outColor;
     [vk_location(3)]
+    float2 outUV;
+    [vk_location(4)]
     float4 misc;
 };
 
@@ -42,7 +35,7 @@ struct PushConstants
 PushConstants push_constants;
 
 [[vk_binding(0, 0)]]
-Texture2D<float4> images[];
+Texture2DArray images[];
 
 [[vk_binding(1, 0)]]
 SamplerState samplers[];
@@ -52,6 +45,10 @@ ConstantBuffer<SceneData> scene_data;
 
 [[vk_binding(1, 1)]]
 ConstantBuffer<OceanData> ocean_data;
+[[vk_binding(2, 1)]]
+ConstantBuffer<SpectrumParams, Std430DataLayout> params;
+
+
 /*
     Engine assumes a z-up axis convention, reference the engine documentation for specifics
     This ocean will abide that convention.
@@ -60,22 +57,36 @@ ConstantBuffer<OceanData> ocean_data;
 VSOutput main(uint vertex_index: SV_VertexID)
 {
     Vertex v = push_constants.vertex_buffer[vertex_index];
-
+    
     float4 position = float4(v.position, 1.0);
-    VSOutput output;
-    //float2 tiled_uvs = float2(position.x % ocean_data.texture_size, position.y % ocean_data.texture_size);
-    float2 uvs = float2(v.uv_x, v.uv_y);
-    float4 spec = images[ocean_data.displacement_index].SampleLevel(samplers[0], uvs,  0.0);
-    output.pos = float4(position.xyz + spec.xyz, 1.0);
-    output.worldPos = output.pos.xyz;
-    output.pos = mul(scene_data.view_proj, mul(push_constants.render_matrix, output.pos));
+    float2 slope = float2(0);
 
-    output.outColor = v.color.xyz;
+    for(int i = 0; i < SPECTRUMS; i++) {
+
+       float3 spectrum_uv = float3(v.position.x / params.length_scale[i], v.position.y / params.length_scale[i], (float)i);
+
+       float4 spec = images[ocean_data.displacement_index].SampleLevel(samplers[0], spectrum_uv,  0.0);
+       position.xyz += spec.xyz; 
+        slope += images[ocean_data.slope_index].SampleLevel(samplers[0], spectrum_uv, 0.0).xy;
+    }
+
+    VSOutput output;
+
+
+    float3 tangent = float3(1.0, 0.0, slope.x);
+    float3 bitangent = float3(0.0, 1.0, slope.y);
+    output.normal = normalize(cross(tangent, bitangent));
+    //float2 tiled_uvs = float2(position.x % ocean_data.texture_size, position.y % ocean_data.texture_size);
+    output.pos = float4(position.xyz, 1.0);
+    output.pos = mul(push_constants.render_matrix, output.pos);
+    output.worldPos = output.pos.xyz;
+    output.pos = mul(scene_data.view_proj, output.pos);
+
+    output.outColor = v.color;
     output.outUV.x = v.uv_x;
     output.outUV.y = v.uv_y;
-    
-    output.misc = float4(spec.w, 0.0, 0.0, 0.0);
-    if(isnan(position.x) || isnan(position.y) || isnan(position.z) || isnan(spec.w)) {
+    output.misc = float4(position.w, 0.0, 0.0, 0.0);
+    if(isnan(position.x) || isnan(position.y) || isnan(position.z) || isnan(position.w)) {
         output.misc.y = 1.0;
     }
     return output;

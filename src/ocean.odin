@@ -12,14 +12,14 @@ import im "libs:imgui"
 
 GLOBALS : ^astro.Engine_Globals
 
-SPECTRUM_TEXTURE_SIZE :: 512 
+SPECTRUM_TEXTURE_SIZE :: 256 
 DOMAIN_GRAPH_EXTENT :: vk.Extent3D{SPECTRUM_TEXTURE_SIZE, SPECTRUM_TEXTURE_SIZE, 1}
 
 OCEAN_PLANE_SIZE :: 1024
 OCEAN_PATCH_SIZE :: SPECTRUM_TEXTURE_SIZE 
 OCEAN_VERTEX_DENSITY :: 1
 OCEAN_SPECTRUMS :: 4
-TEXTURES :: 3
+TEXTURES :: 4
 Ocean :: struct {
 
     plane_size: u32,
@@ -30,11 +30,11 @@ Ocean :: struct {
     mesh_idx: i32,
     node_idx: i32,
     ocean_data: ^Ocean_Data,
-    render_ocean_data: ^Ocean_Data,
     scene_data: ^astro.GPU_Scene_Data,
     plane_transform: la.Matrix4f32,
     compute_data: Ocean_Compute,
     render_pipeline: astro.Shader_Pipeline,
+    debug_render_pipeline: astro.Shader_Pipeline,
     spectrums: u32,
     spectrum_initialized: bool,
     paused: bool, 
@@ -58,7 +58,7 @@ Ocean_Data :: struct {
     mesh_gap_size: f32, 
     spectrum_texel_size: f32,
     displacement_index: u32,
-
+    slope_index: u32,
     spectrums:u32,
 }
 
@@ -74,7 +74,6 @@ Spectrum_Parameters :: struct {
     wind_angle: [OCEAN_SPECTRUMS]f32,
 
     choppiness: [OCEAN_SPECTRUMS]f32, 
-    short_wave_fade: [OCEAN_SPECTRUMS]f32,
 
     wind_spread_control:[OCEAN_SPECTRUMS]f32,
 
@@ -82,10 +81,7 @@ Spectrum_Parameters :: struct {
     swell:f32,
     toggle:b32,
     jacobian_modifier: f32,
-
-
 }
-
 
 @(export)
 game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
@@ -97,7 +93,9 @@ game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
     fragment, has_fragment := astro.shader_manager_get_shader(&engine.shader_manager, "game/ocean/ocean.frag")
     vertex, has_vertex := astro.shader_manager_get_shader(&engine.shader_manager, "game/ocean/ocean.vert")
     compute, has_compute := astro.shader_manager_get_shader(&engine.shader_manager, "game/ocean/generate_jonswap.comp")
-    if !has_fragment || !has_vertex || !has_compute {
+
+
+    if !has_fragment || !has_vertex || !has_compute{
         return false
     }
 
@@ -113,10 +111,16 @@ game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
     //Spectrum Texture
     ocean.compute_data.image_allocations[1] = astro.create_image_default(engine, DOMAIN_GRAPH_EXTENT, .R32G32B32A32_SFLOAT, image_usages, layers = OCEAN_SPECTRUMS * 2) or_return
     //Displacement Texture
-    ocean.compute_data.image_allocations[2] = astro.create_image_default(engine, DOMAIN_GRAPH_EXTENT, .R32G32B32A32_SFLOAT, image_usages) or_return
+    ocean.compute_data.image_allocations[2] = astro.create_image_default(engine, DOMAIN_GRAPH_EXTENT, .R32G32B32A32_SFLOAT, image_usages, layers = OCEAN_SPECTRUMS) or_return
+    ocean.compute_data.image_allocations[3] = astro.create_image_default(engine, DOMAIN_GRAPH_EXTENT, .R32G32_SFLOAT, image_usages, layers = OCEAN_SPECTRUMS) or_return
+
+
+
+
     ocean.compute_data.textures[0] = astro.memory_manager_register_texture(ocean.compute_data.image_allocations[0]) or_return
     ocean.compute_data.textures[1] = astro.memory_manager_register_texture(ocean.compute_data.image_allocations[1]) or_return
     ocean.compute_data.textures[2] = astro.memory_manager_register_texture(ocean.compute_data.image_allocations[2]) or_return
+    ocean.compute_data.textures[3] = astro.memory_manager_register_texture(ocean.compute_data.image_allocations[3]) or_return
 
 
     builder: astro.Compute_Pipeline_Builder
@@ -125,8 +129,9 @@ game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
     astro.pipeline_builder_bind_image(&builder, ocean.compute_data.textures[0], "initial_spectrum")
     astro.pipeline_builder_bind_image(&builder, ocean.compute_data.textures[1], "spectrum")
     astro.pipeline_builder_bind_image(&builder, ocean.compute_data.textures[2], "displacement")
-    astro.pipeline_builder_bind_uniform_ptr(&builder, &ocean.ocean_data, "ocean_data")
-    astro.pipeline_builder_bind_uniform_ptr(&builder, &ocean.compute_data.spectrum_params, "params")
+    astro.pipeline_builder_bind_image(&builder, ocean.compute_data.textures[3], "slope")
+    ocean_data := astro.pipeline_builder_bind_uniform_ptr(&builder, &ocean.ocean_data, "ocean_data")
+    spectrum_params := astro.pipeline_builder_bind_uniform_ptr(&builder, &ocean.compute_data.spectrum_params, "params")
 
     ocean.compute_data.pipelines = astro.compute_pipeline_builder_build_all(&builder, engine) or_return
 
@@ -134,7 +139,8 @@ game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
     astro.graphics_pipeline_builder_init(&builder2, &engine.memory_manager, engine.vk_device)
     astro.graphics_pipeline_builder_set_shaders(&builder2, astro.Render_Shaders{vertex = vertex, fragment = fragment})
     astro.pipeline_builder_bind_uniform_ptr(&builder2, &ocean.scene_data, "scene_data")
-    astro.pipeline_builder_bind_uniform_ptr(&builder2, &ocean.render_ocean_data, "ocean_data")
+    astro.pipeline_builder_bind_existing_uniform_ptr(&builder2, &ocean.ocean_data, ocean_data, "ocean_data")
+    astro.pipeline_builder_bind_existing_uniform_ptr(&builder2, &ocean.compute_data.spectrum_params, spectrum_params, "params")
     astro.graphics_pipeline_builder_set_input_topology(&builder2, .TRIANGLE_LIST)
     astro.graphics_pipeline_builder_set_polygon_mode(&builder2, .FILL)
     astro.graphics_pipeline_builder_set_cull_mode(&builder2, vk.CullModeFlags_NONE, .CLOCKWISE)
@@ -156,7 +162,10 @@ game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
     ocean.ocean_data.mesh_size_x = OCEAN_PLANE_SIZE
     ocean.ocean_data.mesh_size_y = OCEAN_PLANE_SIZE
     ocean.ocean_data.texture_size = DOMAIN_GRAPH_EXTENT.width
+
     ocean.ocean_data.displacement_index = ocean.compute_data.textures[2].heap_ref.index
+    ocean.ocean_data.slope_index = ocean.compute_data.textures[3].heap_ref.index
+
     ocean.ocean_data.mesh_gap_size = (1.0 / f32(OCEAN_VERTEX_DENSITY))
     ocean.ocean_data.spectrum_texel_size = (f32(OCEAN_PLANE_SIZE) / f32(SPECTRUM_TEXTURE_SIZE))
     scale: i32 = 32 
@@ -173,8 +182,8 @@ game_init :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok: bool,) {
     ocean.compute_data.spectrum_params.wind_span = 100
     ocean.compute_data.spectrum_params.wind_angle = 180
 
-    ocean.compute_data.spectrum_params.short_wave_fade = 1.5
     ocean.compute_data.spectrum_params.jacobian_modifier = 1.0 
+
 
 
     return true
@@ -239,7 +248,6 @@ game_update :: proc(scene: ^astro.Scene, engine: ^astro.Engine, delta_time: f32)
     if !ocean.paused {
         ocean_data.time += delta_time 
     }
-    ocean.render_ocean_data^ = ocean_data^
     ocean.scene_data^ = engine.scene_data
     
     return true
@@ -413,9 +421,6 @@ game_draw_ui :: proc(scene: ^astro.Scene, engine: ^astro.Engine) ->(ok:bool) {
                 params.initialized[i] = false
             }
             if im.SliderFloat("Storm Maturity", &params.storm_maturity[i], 1.0, 10.0) {
-                params.initialized[i] = false
-            }
-            if im.SliderFloat("Short Wave Fade", &params.short_wave_fade[i], .1, 10.0) {
                 params.initialized[i] = false
             }
     
